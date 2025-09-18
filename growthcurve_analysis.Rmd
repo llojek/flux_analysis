@@ -1,0 +1,307 @@
+---
+title: "MIDGE Aim 2 Growth Curve Pipeline"
+output: html_document
+date: "2025-07-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load libraries
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(tidyverse)
+library(splines)
+```
+
+#Load in and merge gc_file and gc_layout
+```{r}
+data_folder <- "../data/growth_curves/"
+
+# List all gc_file files
+gc_files <- list.files(data_folder, pattern = "\\d{4}-\\d{2}-\\d{2}_gc_file.txt$", full.names = TRUE)
+
+# Helper function to extract date from filename
+get_date <- function(filename) {
+  str_extract(filename, "\\d{4}-\\d{2}-\\d{2}")
+}
+
+process_experiment <- function(gc_file_path) {
+  date <- get_date(gc_file_path)
+  gc_layout_path <- file.path(data_folder, paste0(date, "_gc_layout.csv"))
+  message("Processing: ", gc_file_path)
+  
+  if (!file.exists(gc_layout_path)) {
+    warning("Matching gc_layout not found for ", gc_file_path, "; skipping.")
+    return(NULL)
+  }
+  
+  # Safely read and process the growth curve file
+  gc_file <- tryCatch(
+    read_tsv(gc_file_path, locale = locale(encoding = "latin1")) %>% select(-2),
+    error = function(e) { warning("Could not read gc_file: ", gc_file_path); return(NULL) }
+  )
+  if (is.null(gc_file)) return(NULL)
+  
+  # Pivot to long format
+  gc_file_long <- gc_file %>%
+    pivot_longer(-Time, names_to = "well", values_to = "values")
+  
+  # Read and check the layout file
+  gc_layout <- tryCatch(
+    read_csv(gc_layout_path),
+    error = function(e) { warning("Could not read gc_layout: ", gc_layout_path); return(NULL) }
+  )
+  if (is.null(gc_layout)) return(NULL)
+  
+  # Merge
+  gc_merged <- left_join(gc_file_long, gc_layout, by = "well") %>%
+    mutate(experimentdate = date)
+  
+  # Optionally: Print preview for each file
+  print(head(gc_merged, 2))
+  
+  return(gc_merged)
+}
+
+# Combine all experiments
+all_growth_data <- gc_files %>%
+  map_dfr(process_experiment) %>%
+  mutate(time = as.numeric(hms(Time)) / 3600 #time for hours
+  ) %>%
+  select(-Time) %>%
+  rename(Time = "time") %>%
+  select(Time, well, values, strain, experimentdate)
+
+# Optional to inspect result
+head(all_growth_data)
+```
+
+#adding technical and biological replicates means
+```{r}
+all_growth_data_noNA <- all_growth_data %>%
+  na.omit() %>%
+  group_by(strain, experimentdate, Time) %>%
+  mutate(tech_avg = mean(values),
+         tech_sd = sd(values),
+         #Identify Outlier Wells per Group
+         is_well_outlier = abs(values - tech_avg) > 2 * tech_sd)%>% # mark if 2 SDs from mean) 
+   mutate(n_tech = n()) %>%
+  ungroup() %>%
+  group_by(strain, Time) %>%
+  mutate(bio_avg = mean(tech_avg),
+         bio_sd = sd(tech_avg),
+         #Identify Outlier Experiments per Group
+         is_bio_outlier = abs(tech_avg - bio_avg) > 2 * bio_sd) %>% # you can use 2 or 3 SDs) 
+  mutate(n_bio = n_distinct(experimentdate)) %>%
+  ungroup()
+```
+
+#individual curve of the technical replicates for each strain
+```{r}
+all_growth_data_noNA %>%
+  ggplot(aes(x = Time, y = values, group = well, color = strain)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(strain ~ experimentdate) +
+  labs(title = "Technical Replicates: Each Well per Strain and Date")
+```
+
+#individual curve for each of the biological replicate
+```{r}
+tech_summary <- all_growth_data_noNA %>%
+  group_by(strain, experimentdate, Time) %>%
+  summarize(tech_avg = mean(values), .groups = "drop")
+
+ggplot(tech_summary, aes(x = Time, y = tech_avg, group = experimentdate, color = experimentdate)) +
+  geom_line() +
+  facet_wrap(~strain) +
+  labs(title = "Biological Replicates: Mean Curve for Each Experiment Date per Strain")
+```
+
+#calculating the growth rate
+##growth rate function
+```{r}
+library(splines)
+get_slope <- function(x,y){
+  # Fit smoothing spline
+    spline_fit <- smooth.spline(x, log(y), spar = 0.6)
+
+  # Predict derivative (slope)
+  spline_deriv <- predict(spline_fit, deriv = 1)[[2]]
+  
+  return(spline_deriv)
+}
+
+concat_slope <- function(df, window_size) {
+  # df <- analysis_data  %>%
+  # mutate(value = ifelse(values<=0, 1e-7, values)) %>%
+  # group_by(strain,well) %>%
+  # arrange(strain,well,Time)
+  # Safely return empty result if df is empty or too short
+  if (nrow(df) < window_size) {
+    return(data.frame(
+      Time = numeric(0),
+      OD = numeric(0),
+      growth_rate = numeric(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  t <- df$Time
+  od <- df$values
+
+  summary_df <- data.frame(
+    Time = numeric(0),
+    OD = numeric(0),
+    growth_rate = numeric(0),
+    stringsAsFactors = FALSE
+  )
+
+  for(i in 1:(nrow(df) - (window_size - 1))) {
+    x <- t[i:(i + window_size - 1)]
+    y <- od[i:(i + window_size - 1)]
+    slope <- get_slope(x = x, y = y)
+
+    new_df <- data.frame(
+      Time = t[i + round(window_size / 2) - 1],
+      OD = od[i + round(window_size / 2) - 1],
+      growth_rate = slope,
+      stringsAsFactors = FALSE
+    )
+
+    summary_df <- rbind(summary_df, new_df)
+  }
+
+  return(summary_df)
+}
+  
+
+```
+
+##Calculating the growth rate 
+```{r}
+analysis_data <- all_growth_data_noNA 
+
+growth_summary_df <- analysis_data  %>%
+  mutate(value = ifelse(values<=0, 1e-7, values)) %>%
+  group_by(strain,well) %>%
+  arrange(strain,well,Time) %>%
+  group_modify(~ concat_slope(.x, 4)) %>%
+  ungroup() %>%
+  group_by(strain,well,Time, OD) %>%
+  summarise(growth_rate = mean(growth_rate, na.rm = TRUE), .groups = "drop") %>%
+  ungroup()
+
+growth_summary_df <- growth_summary_df %>%
+  group_by(Time, strain, well) %>%
+  merge(analysis_data, by = c("strain", "well", "Time"))
+```
+
+##Identifying the max growth rate
+```{r}
+###Check if the growth rate is consistent over time
+growth_summary_df <- growth_summary_df %>%
+  filter( OD>1e-02) %>%
+  group_by(strain, experimentdate) %>%
+  mutate(growth_rank  = rank(-growth_rate),
+         similar_neighbor = ifelse(growth_rank - lead(growth_rank) <=abs(5) & growth_rank - lag(growth_rank) <=abs(5), TRUE, FALSE))
+
+### Graph the growth rates
+growth_summary_df %>%
+  ggplot() + geom_point(aes(y = growth_rate, x = Time, color = strain)) + facet_wrap(.~strain) 
+```
+
+##Extract probably maximum growth rate
+```{r}
+max_growth_df <- growth_summary_df %>%
+  group_by(strain, experimentdate) %>%
+  #filter(OD>0.2) %>% # remove the OD values that are too low
+  filter(similar_neighbor==TRUE)%>%
+  filter(Time<=6) %>% # log phase
+  filter(growth_rank ==min(growth_rank)) %>%
+  group_by(strain) %>%
+  mutate(avg_growth_rate = mean(growth_rate)) %>%
+  ungroup()
+
+# get the strains that has no growth
+no_growth_df <- max_growth_df %>%
+  filter(OD==0) %>%
+  distinct(strain, experimentdate)
+
+
+max_growth_df <- max_growth_df %>%
+  mutate(OD_range = case_when(OD <= 0 ~ "OD = 0",
+                   OD < 0.2 & OD>0 ~ "0 < OD < 0.2",
+                   OD >= 0.2 ~ "OD>=0.2")) 
+
+
+## plot the Condition and growth rates y: time
+max_growth_df %>%
+  ggplot(aes(x = growth_rate, y = Time, color = strain)) + geom_point(size=2) 
+
+max_growth_df %>%
+  filter(growth_rate!=0) %>%
+  #filter(OD_range!="0 < OD < 0.2") %>%
+  ggplot(aes(x = growth_rate, y = OD, color = strain)) + 
+  geom_point(size =2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black")
+```
+
+##Identifying info on the trend line
+```{r}
+library(ggplot2)
+library(broom)
+
+# Fit linear model
+model <- lm(OD ~ growth_rate, data = max_growth_df %>% filter(growth_rate != 0))
+
+# Extract coefficients and R-squared
+coefs <- coef(model)
+r2 <- summary(model)$r.squared
+
+# Create annotation string
+eqn <- sprintf("y = %.3fx + %.3f\nR² = %.3f", coefs[2], coefs[1], r2)
+
+max_growth_df %>%
+  filter(growth_rate != 0) %>%
+  ggplot(aes(x = growth_rate, y = OD)) +
+  geom_point(aes(color = strain), size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  annotate("text", x = Inf, y = -Inf, label = eqn, hjust = 1.1, vjust = -0.4, size = 5, color = "black") +
+  theme_minimal()
+```
+
+#Calculating the lag time
+
+
+
+#Calculating the maxOD
+```{r}
+maxOD_df <- analysis_data %>%
+  group_by(strain, experimentdate) %>%
+  filter(values == max(values, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(max_OD = values)
+
+maxOD_df %>%
+  ggplot(aes(x = strain, y = max_OD)) +
+  geom_point(aes(color = strain), size = 2) +
+  labs(title = "Maximum growth",
+       y = "OD") +
+  theme_minimal()
+```
+
+#Merging the dataframes
+```{r}
+summary_df <- max_growth_df %>%
+  select(strain, growth_rate) %>%
+  full_join(maxOD_df, by = "strain") %>%
+  select(strain, growth_rate, max_OD)
+  
+```
+

@@ -1,0 +1,341 @@
+---
+title: "fluctuation analysis QC"
+author: "Tiffany Wan"
+date: "2025-07-22"
+output: html_document
+---
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(data.table)
+library(table1)
+```
+
+# read in the files
+```{r}
+# type the path of excel file
+path <- "../data/Timepoint_flux_data.xlsx"
+
+# CFU data
+CFU_df <- read_xlsx(path ,sheet = "New_CFU")
+
+# fluctuation analysis well counts
+Flux_df <- read_xlsx(path,sheet = "New_flux_result")
+
+# reformat time variable
+
+```
+
+# CFU calculations
+```{r}
+# make the data frame into long form
+CFU_df_long <- CFU_df %>%
+  pivot_longer(cols = paste0(rep("D",8),1:8),names_to = "Dilution", values_to = "N_colony") %>%
+  filter(N_colony>2) %>%
+  mutate(CFU = N_colony*10**as.numeric(gsub("D","",Dilution))*20) # formula: CFU = Number of colony * 10 ** (Dilution factor) * 20
+
+# average across dilution factor
+CFU_df_dilution_avg <- CFU_df_long %>%
+  group_by(Date, Strain, Replicate, Plate, Time) %>% # by dilution factor
+  summarise(avg_CFU_by_dilution = mean(CFU))
+
+CFU_df_long  %>%
+  ggplot(aes(x = Strain, y = CFU)) + geom_boxplot() + geom_jitter(aes(color = Dilution)) + facet_grid(.~Time)+ scale_y_log10() + theme(axis.text.x = element_text(angle = 45, hjust=1))
+# plot all CFU 
+CFU_df_dilution_avg %>%
+  ggplot(aes(x = Strain, y = avg_CFU_by_dilution)) + geom_boxplot() + geom_jitter(aes(color = Plate)) + facet_grid(.~Time)+ scale_y_log10()+ theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+CFU_df_dilution_avg %>%
+  ggplot(aes(x = as.factor(Time), y = avg_CFU_by_dilution)) + geom_boxplot() + geom_point(aes(color = Date)) + facet_grid(.~Strain)+ scale_y_log10()+ theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+# average across technical replicates 
+CFU_df_replicate_avg <- CFU_df_long %>%
+  group_by(Date, Strain, Plate,Time) %>% # by replicate
+  summarise(avg_CFU_by_replicate = mean(CFU))
+
+
+
+```
+
+# FLuctuation analysis data QC
+```{r}
+# Number of wells that are tolerant
+Flux_df$T_wells <- Flux_df$N_growth - Flux_df$R_wells
+
+# QC metrics: 
+Flux_df <- Flux_df %>%
+  mutate(prop_R_well = R_wells/N_wells,
+         optimal_growth = ifelse(prop_R_well>=0.2 & prop_R_well<=0.8, TRUE, FALSE),
+         D1_lt_30 = ifelse(D1<30, TRUE, FALSE),
+         D1_lt_30 = ifelse(is.na(D1_lt_30), TRUE, D1_lt_30), # deal with missing data: there were no info for these test but we know there were no resistant cells per Lisa
+         passQC = ifelse(optimal_growth ==TRUE & D1_lt_30, TRUE,FALSE))
+```
+
+# merge CFU and Fluctuation analysis results together
+```{r}
+CFU_flux_result <- merge(CFU_df_replicate_avg, Flux_df, by = c("Date","Strain","Plate","Time"),all = TRUE)
+```
+
+# Plot figures
+```{r}
+# optimal growth
+CFU_flux_result %>%
+  ggplot()+ geom_point(aes(x = prop_R_well, y = avg_CFU_by_replicate, color = Strain, shape = Plate))+ geom_vline(xintercept = c(0.2,0.8), color = "red",linetype = "dashed") + facet_grid(Time~.) +labs(title = "The number of resistant wells between 20-80%")+ scale_y_log10()
+
+# 
+CFU_flux_result %>%
+  ggplot()+ geom_point(aes(x = prop_R_well, y = avg_CFU_by_replicate, color = Strain, shape = Plate)) + facet_grid(Time~D1_lt_30) + labs(title = "First dilution before plating cells on colistin") + scale_y_log10()
+
+# pass QC
+CFU_flux_result %>%
+  ggplot()+ geom_point(aes(x = prop_R_well, y = avg_CFU_by_replicate, color = Strain, shape = Plate)) + facet_grid(Time~passQC) + labs(title = "Passing QC")+ scale_y_log10()
+```
+# Table1
+```{r}
+pass_QC_df <- CFU_flux_result %>%
+  filter(passQC==TRUE)
+
+
+library(gt)
+
+
+pass_QC_df  %>%
+  select(Strain, Time, prop_R_well, avg_CFU_by_replicate,D1) %>%
+  arrange(Strain) %>%
+  gt() %>%
+  tab_header(
+    title = "Strains passing QC"
+  ) %>%
+  cols_label(
+    Strain = "Strain ID",
+    Time = "Time (hours)"
+  ) %>%
+  fmt_number(columns = Time, decimals = 0)
+
+
+
+
+```
+# Table2
+```{r}
+pass_QC_df_v <- unique(pass_QC_df$Strain)
+fail_QC_df <- CFU_flux_result %>%
+  filter(optimal_growth==FALSE) %>%
+  filter(!(Strain %in%pass_QC_df_v))
+
+fail_QC_df$closest_time <- FALSE
+
+for (i in unique(fail_QC_df$Strain)) {
+  subdf <- fail_QC_df %>%
+    filter(Strain == i)
+  
+  # Check if any values are already between 0.2 and 0.8
+  in_range <- which(subdf$prop_R_well > 0.2 & subdf$prop_R_well < 0.8)
+  
+  if (length(in_range) > 0) {
+    # Choose the value closest to 0.5 (center of pass range)
+    closest_idx <- in_range[which.min(abs(subdf$prop_R_well[in_range] - 0.5))]
+  } else {
+    # Nothing in range, find value closest to 0.2 or 0.8 (whichever is closer)
+    closest_idx <- which.min(pmin(abs(subdf$prop_R_well - 0.2), abs(subdf$prop_R_well - 0.8)))
+  }
+  
+  # Find global index to update
+  global_idx <- which(fail_QC_df$Strain == i)[closest_idx]
+  fail_QC_df$closest_time[global_idx] <- TRUE
+}
+```
+
+# Strains failing QC
+```{r}
+library(gt)
+
+
+fail_QC_df  %>%
+  filter(closest_time==TRUE) %>%
+  filter(prop_R_well<0.2 & D1<=30) %>%
+  select(Strain, Time, prop_R_well, avg_CFU_by_replicate,D1) %>%
+  arrange(Strain) %>%
+  gt() %>%
+  tab_header(
+    title = "Resistant well < 20%"
+  ) %>%
+  cols_label(
+    Strain = "Strain ID",
+    Time = "Time (hours)"
+  ) %>%
+  fmt_number(columns = Time, decimals = 0)
+
+fail_QC_df  %>%
+  filter(closest_time==TRUE) %>%
+  filter(prop_R_well>0.8 & D1<=30) %>%
+  select(Strain, Time, prop_R_well, avg_CFU_by_replicate,D1) %>%
+  arrange(Strain) %>%
+  gt() %>%
+  tab_header(
+    title = "Resistant well > 80%"
+  ) %>%
+  cols_label(
+    Strain = "Strain ID",
+    Time = "Time (hours)"
+  ) %>%
+  fmt_number(columns = Time, decimals = 0)
+
+fail_QC_df  %>%
+  filter(closest_time==TRUE) %>%
+  filter(D1>30) %>%
+  select(Strain, Time, prop_R_well, avg_CFU_by_replicate,D1) %>%
+  arrange(Strain) %>%
+  gt() %>%
+  tab_header(
+    title = "D1 >30"
+  ) %>%
+  cols_label(
+    Strain = "Strain ID",
+    Time = "Time (hours)"
+  ) %>%
+  fmt_number(columns = Time, decimals = 0)
+
+
+
+
+```
+
+# Update script to clear New results and move to results
+```{r}
+library(openxlsx)
+
+file <- path
+
+# Load workbook
+wb <- loadWorkbook(path)
+
+
+####### Flux result ###########
+# Count how many rows are already in Flux result
+n_existing <- nrow(read.xlsx(wb, sheet = "Flux_result"))
+
+# Append new_flux_results starting right after the last row
+writeData(
+  wb,
+  sheet = "Flux_result",
+  x = Flux_df,
+  startRow = n_existing + 2,  # +1 for header, +1 for next free row
+  colNames = FALSE            # don’t repeat headers
+)
+
+# update the column names for new sheet
+new_colnames <- colnames(Flux_df)  # change as needed
+writeData(
+  wb,
+  sheet = "Flux_result",
+  x = as.data.frame(t(new_colnames)),  # write as one row
+  startRow = 1, startCol = 1,
+  colNames = FALSE
+)
+
+# clear out results from New_flux_results
+empty_df <- setNames(data.frame(matrix(ncol = length(headers), nrow = 0)), new_colnames)
+
+# Completely remove the old sheet (removes all leftover rows)
+removeWorksheet(wb, "New_flux_result")
+
+# Recreate sheet fresh
+addWorksheet(wb, "New_flux_result")
+
+# Write back only headers
+writeData(wb, sheet = "New_flux_result", x = empty_df)
+####### End Flux result ##########
+
+####### CFU result ############
+# Count how many rows are already in Flux result
+n_existing <- nrow(read.xlsx(wb, sheet = "CFU"))
+
+# Append new_flux_results starting right after the last row
+writeData(
+  wb,
+  sheet = "CFU",
+  x = CFU_df,
+  startRow = n_existing + 2,  # +1 for header, +1 for next free row
+  colNames = FALSE            # don’t repeat headers
+)
+
+# update the column names for new sheet
+new_colnames <- colnames(CFU_df)  # change as needed
+writeData(
+  wb,
+  sheet = "CFU",
+  x = as.data.frame(t(new_colnames)),  # write as one row
+  startRow = 1, startCol = 1,
+  colNames = FALSE
+)
+
+# clear out results from New_flux_results
+empty_df <- setNames(data.frame(matrix(ncol = 10, nrow = 0)), new_colnames)
+
+# Completely remove the old sheet (removes all leftover rows)
+removeWorksheet(wb, "New_CFU")
+
+# Recreate sheet fresh
+addWorksheet(wb, "New_CFU")
+
+# Write back only headers
+writeData(wb, sheet = "New_CFU", x = empty_df )
+```
+
+# Save updated excel file
+```{r}
+# Save changes in place (preserves formatting)
+saveWorkbook(wb, "../data/Timepoint_flux_data1.xlsx", overwrite = TRUE)
+
+```
+
+
+# 1. CFU at 1 time point across experiments
+```{r}
+CFU_flux_result %>%
+#  group_by(Date,Strain) %>%
+ # filter(n()>1) %>%
+  ggplot() + geom_line(aes(as.factor(Time), y = avg_CFU_by_replicate,group = interaction(Strain,Date), color = as.factor(Date))) + geom_boxplot(aes(x = as.factor(Time), y = avg_CFU_by_replicate,color = as.factor(Date)))+ scale_y_log10() + facet_grid(Strain~., scales = "free") + theme(axis.text.x = element_text(angle = 45,hjust =1)) 
+```
+# 2. Resistant wells/CFU
+```{r}
+CFU_flux_result %>%
+  ggplot() + geom_point(aes(x = Time, y = R_wells/avg_CFU_by_replicate,color = as.factor(Date)))+ scale_y_log10()+ facet_grid(Strain~., scales = "free_x")
+```
+# 3. Change of CFU from time =0 to time=n
+```{r}
+# Time_0_flux <- CFU_flux_result %>%
+#   filter(Time==0)
+# 
+# Exp_flux <- CFU_flux_result %>%
+#   group_by(Date, Strain) %>%
+#   filter(Time>0)
+# 
+# uniq_exp_strain <- CFU_flux_result %>%
+#   distinct(Date, Strain)
+# group_id <- 1
+# for(i in seq_along(uniq_exp_strain)){
+#   sub_df_0 <- CFU_flux_result %>%
+#     filter(Date==uniq_exp_strain$Date[i] & Strain==uniq_exp_strain$Strain[i]) %>%
+#     filter(Time==0) 
+#   sub_df_Other <- CFU_flux_result %>%
+#     filter(Date==uniq_exp_strain$Date[i] & Strain==uniq_exp_strain$Strain[i]) %>%
+#     filter(Time>0) 
+#   n_pairs_i <- nrow(sub_df_Other)
+#   data.frame(Time = ,
+#              CFU = ,
+#              Date = ,
+#              Strain = ,
+#              )
+# }
+CFU_flux_result %>%
+  mutate(Starting_point = ifelse(Time==0,"No","Yes")) %>%
+  ggplot() + geom_line(aes(x = Time, y = avg_CFU_by_replicate,group = interaction(Date,Strain,Plate),color = as.factor(Date))) + geom_point(aes(x = Time, y = avg_CFU_by_replicate,color = as.factor(Date))) + scale_y_log10() + facet_grid(.~Strain)
+
+  
+
+
+
+```
